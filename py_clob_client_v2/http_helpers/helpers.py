@@ -1,4 +1,5 @@
 import logging
+import threading
 import time
 
 import httpx
@@ -13,6 +14,15 @@ from py_clob_client_v2.clob_types import (
 )
 from ..exceptions import PolyApiException
 
+from app.services.polymarket_rate_limiter import (
+    acquire_polymarket_rate_limit,
+    is_place_order_request,
+    RateLimitDiscardedError,
+    record_polymarket_request_error,
+    record_polymarket_cloudflare_block,
+    try_acquire_polymarket_rate_limit,
+)
+
 logger = logging.getLogger(__name__)
 
 GET = "GET"
@@ -20,6 +30,7 @@ POST = "POST"
 DELETE = "DELETE"
 PUT = "PUT"
 
+_http_client_lock = threading.Lock()
 _http_client = httpx.Client(http2=True)
 
 def _overload_headers(method: str, headers: dict) -> dict:
@@ -47,9 +58,20 @@ def _is_transient_error(exc: Exception, status_code: int = None) -> bool:
         (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError),
     )
 
-def request(endpoint: str, method: str, headers=None, data=None, params=None):
+def request(endpoint: str, method: str, headers=None, data=None, params=None, _retried=False):
+    global _http_client
     headers = _overload_headers(method, headers)
     try:
+        with _http_client_lock:
+            if getattr(_http_client, "is_closed", False):
+                _http_client = httpx.Client(http2=True)
+
+        if is_place_order_request(method, endpoint):
+            if not try_acquire_polymarket_rate_limit(method, endpoint):
+                raise RateLimitDiscardedError(f"Rate limited, discarding: {method} {endpoint}")
+            else:
+                acquire_polymarket_rate_limit(method, endpoint)
+
         if isinstance(data, str):
             resp = _http_client.request(
                 method=method,
@@ -68,7 +90,19 @@ def request(endpoint: str, method: str, headers=None, data=None, params=None):
             )
 
         if resp.status_code != 200:
-            # resp.text is the server response body (no credentials are logged here)
+            record_polymarket_request_error(method, endpoint)
+
+            # Cloudflare HTTP/2 stuck connection workaround
+            if resp.status_code == 400 and "cloudflare" in (resp.text or "").lower():
+                record_polymarket_cloudflare_block()
+                with _http_client_lock:
+                    if getattr(_http_client, "is_closed", False) is False:
+                        try:
+                            _http_client.close()
+                        except Exception:
+                            pass
+                        _http_client = httpx.Client(http2=True)
+
             logger.error(
                 "[py_clob_client_v2] request error status=%s url=%s body=%s",
                 resp.status_code,
@@ -84,9 +118,18 @@ def request(endpoint: str, method: str, headers=None, data=None, params=None):
 
     except PolyApiException:
         raise
-    except httpx.RequestError as exc:
-        logger.error("[py_clob_client_v2] request error: %s", exc)
-        raise PolyApiException(error_msg="Request exception!")
+    except (httpx.RequestError, RuntimeError) as e:
+        _retryable_runtime_msgs = ("client has been closed", "deque mutated during iteration")
+        if isinstance(e, RuntimeError) and not any(m in str(e).lower() for m in _retryable_runtime_msgs):
+            raise
+        if not _retried:
+            msg = str(e).lower()
+            if (isinstance(e, RuntimeError) and any(m in msg for m in _retryable_runtime_msgs)) or \
+               (isinstance(e, httpx.RemoteProtocolError) and "server disconnected" in msg):
+                return request(endpoint, method, headers, data, params, _retried=True)
+
+        record_polymarket_request_error(method, endpoint)
+        raise PolyApiException(error_msg=f"Request exception! {e}")
 
 def get(endpoint, headers=None, data=None, params=None):
     return request(endpoint, GET, headers, data, params)
