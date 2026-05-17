@@ -17,6 +17,7 @@ from ..exceptions import PolyApiException
 
 from app.services.polymarket_rate_limiter import (
     acquire_polymarket_rate_limit,
+    classify_polymarket_request,
     is_place_order_request,
     RateLimitDiscardedError,
     record_polymarket_request_error,
@@ -70,8 +71,8 @@ def request(endpoint: str, method: str, headers=None, data=None, params=None, _r
         if is_place_order_request(method, endpoint):
             if not try_acquire_polymarket_rate_limit(method, endpoint):
                 raise RateLimitDiscardedError(f"Rate limited, discarding: {method} {endpoint}")
-            else:
-                acquire_polymarket_rate_limit(method, endpoint)
+        elif classify_polymarket_request(method, endpoint):
+            acquire_polymarket_rate_limit(method, endpoint)
 
         if isinstance(data, str):
             resp = _http_client.request(
