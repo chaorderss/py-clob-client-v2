@@ -1,4 +1,5 @@
 import logging
+import os
 import threading
 import time
 from typing import Optional
@@ -33,7 +34,37 @@ DELETE = "DELETE"
 PUT = "PUT"
 
 _http_client_lock = threading.Lock()
-_http_client = httpx.Client(http2=True)
+
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return max(minimum, int(str(raw).strip()))
+    except (TypeError, ValueError):
+        return default
+
+def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return max(minimum, float(str(raw).strip()))
+    except (TypeError, ValueError):
+        return default
+
+def _build_http_client() -> httpx.Client:
+    max_connections = _env_int("CLOB_HTTP_MAX_CONNECTIONS", 256)
+    max_keepalive = min(_env_int("CLOB_HTTP_MAX_KEEPALIVE_CONNECTIONS", 64), max_connections)
+    keepalive_expiry = _env_float("CLOB_HTTP_KEEPALIVE_EXPIRY", 15.0)
+    limits = httpx.Limits(
+        max_connections=max_connections,
+        max_keepalive_connections=max_keepalive,
+        keepalive_expiry=keepalive_expiry,
+    )
+    return httpx.Client(http2=True, limits=limits)
+
+_http_client = _build_http_client()
 
 def _overload_headers(method: str, headers: dict) -> dict:
     if headers is None:
@@ -66,7 +97,7 @@ def request(endpoint: str, method: str, headers=None, data=None, params=None, _r
     try:
         with _http_client_lock:
             if getattr(_http_client, "is_closed", False):
-                _http_client = httpx.Client(http2=True)
+                _http_client = _build_http_client()
 
         if is_place_order_request(method, endpoint):
             if not try_acquire_polymarket_rate_limit(method, endpoint):
@@ -103,7 +134,7 @@ def request(endpoint: str, method: str, headers=None, data=None, params=None, _r
                             _http_client.close()
                         except Exception:
                             pass
-                        _http_client = httpx.Client(http2=True)
+                        _http_client = _build_http_client()
 
             logger.error(
                 "[py_clob_client_v2] request error status=%s url=%s body=%s",
@@ -131,6 +162,13 @@ def request(endpoint: str, method: str, headers=None, data=None, params=None, _r
                 return request(endpoint, method, headers, data, params, _retried=True)
 
         record_polymarket_request_error(method, endpoint)
+        if "too many open files" in str(e).lower():
+            with _http_client_lock:
+                try:
+                    _http_client.close()
+                except Exception:
+                    pass
+                _http_client = _build_http_client()
         raise PolyApiException(error_msg=f"Request exception! {e}")
 
 def get(endpoint, headers=None, data=None, params=None):
