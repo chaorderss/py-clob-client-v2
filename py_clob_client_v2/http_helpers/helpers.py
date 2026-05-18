@@ -56,7 +56,7 @@ def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
 def _build_http_client() -> httpx.Client:
     max_connections = _env_int("CLOB_HTTP_MAX_CONNECTIONS", 256)
     max_keepalive = min(_env_int("CLOB_HTTP_MAX_KEEPALIVE_CONNECTIONS", 64), max_connections)
-    keepalive_expiry = _env_float("CLOB_HTTP_KEEPALIVE_EXPIRY", 15.0)
+    keepalive_expiry = _env_float("CLOB_HTTP_KEEPALIVE_EXPIRY", 5.0)
     limits = httpx.Limits(
         max_connections=max_connections,
         max_keepalive_connections=max_keepalive,
@@ -65,6 +65,27 @@ def _build_http_client() -> httpx.Client:
     return httpx.Client(http2=True, limits=limits)
 
 _http_client = _build_http_client()
+
+def _get_http_client() -> httpx.Client:
+    global _http_client
+    with _http_client_lock:
+        if getattr(_http_client, "is_closed", False):
+            _http_client = _build_http_client()
+        return _http_client
+
+def _replace_http_client(expected_client: Optional[httpx.Client] = None) -> httpx.Client:
+    global _http_client
+    with _http_client_lock:
+        current = _http_client
+        should_replace_global = expected_client is None or current is expected_client
+        client_to_close = current if expected_client is None else expected_client
+        try:
+            client_to_close.close()
+        except Exception:
+            pass
+        if should_replace_global:
+            _http_client = _build_http_client()
+        return _http_client
 
 def _overload_headers(method: str, headers: dict) -> dict:
     if headers is None:
@@ -92,13 +113,9 @@ def _is_transient_error(exc: Exception, status_code: Optional[int] = None) -> bo
     )
 
 def request(endpoint: str, method: str, headers=None, data=None, params=None, _retried=False):
-    global _http_client
     headers = _overload_headers(method, headers)
+    client = _get_http_client()
     try:
-        with _http_client_lock:
-            if getattr(_http_client, "is_closed", False):
-                _http_client = _build_http_client()
-
         if is_place_order_request(method, endpoint):
             if not try_acquire_polymarket_rate_limit(method, endpoint):
                 raise RateLimitDiscardedError(f"Rate limited, discarding: {method} {endpoint}")
@@ -106,7 +123,7 @@ def request(endpoint: str, method: str, headers=None, data=None, params=None, _r
             acquire_polymarket_rate_limit(method, endpoint)
 
         if isinstance(data, str):
-            resp = _http_client.request(
+            resp = client.request(
                 method=method,
                 url=endpoint,
                 headers=headers,
@@ -114,7 +131,7 @@ def request(endpoint: str, method: str, headers=None, data=None, params=None, _r
                 params=params,
             )
         else:
-            resp = _http_client.request(
+            resp = client.request(
                 method=method,
                 url=endpoint,
                 headers=headers,
@@ -128,13 +145,7 @@ def request(endpoint: str, method: str, headers=None, data=None, params=None, _r
             # Cloudflare HTTP/2 stuck connection workaround
             if resp.status_code == 400 and "cloudflare" in (resp.text or "").lower():
                 record_polymarket_cloudflare_block()
-                with _http_client_lock:
-                    if getattr(_http_client, "is_closed", False) is False:
-                        try:
-                            _http_client.close()
-                        except Exception:
-                            pass
-                        _http_client = _build_http_client()
+                _replace_http_client(client)
 
             logger.error(
                 "[py_clob_client_v2] request error status=%s url=%s body=%s",
@@ -163,12 +174,7 @@ def request(endpoint: str, method: str, headers=None, data=None, params=None, _r
 
         record_polymarket_request_error(method, endpoint)
         if "too many open files" in str(e).lower():
-            with _http_client_lock:
-                try:
-                    _http_client.close()
-                except Exception:
-                    pass
-                _http_client = _build_http_client()
+            _replace_http_client(client)
         raise PolyApiException(error_msg=f"Request exception! {e}")
 
 def get(endpoint, headers=None, data=None, params=None):
